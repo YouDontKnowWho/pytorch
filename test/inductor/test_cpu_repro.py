@@ -4,7 +4,6 @@ import copy
 import functools
 import itertools
 import math
-import os
 import platform
 import sys
 import unittest
@@ -61,16 +60,12 @@ aten = torch.ops.aten
 check_model = test_torchinductor.check_model
 
 requires_vectorization = unittest.skipUnless(
-    cpu_vec_isa.valid_vec_isa_list() and os.getenv("ATEN_CPU_CAPABILITY") != "default",
-    "Does not support vectorization",
+    cpu_vec_isa.valid_vec_isa_list(), "Does not support vectorization"
 )
 
 
 def check_metrics_vec_kernel_count(num_expected_vec_kernels):
-    if (
-        cpu_vec_isa.valid_vec_isa_list()
-        and os.getenv("ATEN_CPU_CAPABILITY") != "default"
-    ):
+    if cpu_vec_isa.valid_vec_isa_list():
         assert metrics.generated_cpp_vec_kernel_count == num_expected_vec_kernels
 
 
@@ -450,10 +445,120 @@ class CPUReproTests(TestCase):
     @torch._dynamo.config.patch(assume_static_by_default=False)
     @torch._dynamo.config.patch(allow_rnn=True)
     @config.patch(freezing=True)
-    def _test_lstm_packed(self, params_dict, change_input_sizes=False):
+    def _test_lstm_packed(
+        self,
+        unbatched,
+        input_size,
+        hidden_size,
+        num_layers,
+        bidirectional,
+        bias,
+        empty_state,
+        batch_first,
+        batch_size,
+        seq_len,
+        change_input_sizes=False,
+    ):
         from torch._dynamo.utils import counters
 
-        for (
+        dtypes = [torch.float]
+        if torch.ops.mkldnn._is_mkldnn_bf16_supported():
+            dtypes.append(torch.bfloat16)
+        if torch.ops.mkldnn._is_mkldnn_fp16_supported():
+            dtypes.append(torch.float16)
+        for dtype in dtypes:
+            counters.clear()
+            num_directions = 2 if bidirectional else 1
+
+            seq_len_var = seq_len + 3
+            if unbatched:
+                v = torch.randn(seq_len, input_size)
+                v_var = torch.randn(seq_len_var, input_size)
+                h = torch.randn(num_layers * num_directions, hidden_size)
+                c = torch.randn(num_layers * num_directions, hidden_size)
+            else:
+                if batch_first:
+                    v = torch.randn(batch_size, seq_len, input_size)
+                    v_var = torch.randn(batch_size, seq_len_var, input_size)
+                else:
+                    v = torch.randn(seq_len, batch_size, input_size)
+                    v_var = torch.randn(seq_len_var, batch_size, input_size)
+                h = torch.randn(num_layers * num_directions, batch_size, hidden_size)
+                c = torch.randn(num_layers * num_directions, batch_size, hidden_size)
+
+            mod = LstmModule(
+                input_size,
+                hidden_size,
+                num_layers,
+                bias,
+                bidirectional,
+                batch_first,
+            ).eval()
+            maybe_autocast = (
+                torch.cpu.amp.autocast()
+                if dtype == torch.bfloat16
+                else contextlib.nullcontext()
+            )
+
+            with torch.no_grad(), maybe_autocast:
+                inps = [v]
+                if not empty_state:
+                    inps.append((h, c))
+
+                fn_opt = torch._dynamo.optimize("inductor")(mod)
+                _, code = run_and_get_cpp_code(fn_opt, *inps)
+
+                # Check that _flat_weights are not functional_tensor, otherwise
+                # deepcopy will fail during recompilation.
+                fn_opt_copy = copy.deepcopy(fn_opt)
+                _flat_weights = fn_opt_copy.lstm._flat_weights
+                for _flat_weight in _flat_weights:
+                    self.assertFalse(torch._is_functional_tensor(_flat_weight))
+
+                self.assertTrue("aten.mkldnn_rnn_layer" in code)
+                self.assertEqual(fn_opt(*inps), mod(*inps))
+                self.assertEqual(
+                    counters["inductor"]["pattern_matcher_count"],
+                    num_layers * num_directions
+                    + 2,  # num of mkldnn_rnn_layer call + 2 view call on the concatenated hy, cy.
+                )
+
+                # Change input sizes
+                if change_input_sizes:
+                    inps_var = [v_var]
+                    self.assertEqual(fn_opt(*inps_var), mod(*inps_var))
+
+    @parametrize(
+        "unbatched, input_size, hidden_size, num_layers, bidirectional, bias, empty_state, batch_first, batch_size, seq_len",
+        itertools.product(
+            *[
+                [True, False],
+                [1, 2],
+                [2],
+                [1, 2],
+                [False, True],
+                [False, True],
+                [False, True],
+                [True, False],
+                [1, 2],
+                [1, 2],
+            ]
+        ),
+    )
+    def test_lstm_packed(
+        self,
+        unbatched,
+        input_size,
+        hidden_size,
+        num_layers,
+        bidirectional,
+        bias,
+        empty_state,
+        batch_first,
+        batch_size,
+        seq_len,
+    ):
+        self._test_lstm_packed(
             unbatched,
             input_size,
             hidden_size,
@@ -464,108 +569,51 @@ class CPUReproTests(TestCase):
             batch_first,
             batch_size,
             seq_len,
-        ) in itertools.product(*list(params_dict.values())):
-            dtypes = [torch.float]
-            if torch.ops.mkldnn._is_mkldnn_bf16_supported():
-                dtypes.append(torch.bfloat16)
-            if torch.ops.mkldnn._is_mkldnn_fp16_supported():
-                dtypes.append(torch.float16)
-            for dtype in dtypes:
-                counters.clear()
-                num_directions = 2 if bidirectional else 1
+        )
 
-                seq_len_var = seq_len + 3
-                if unbatched:
-                    v = torch.randn(seq_len, input_size)
-                    v_var = torch.randn(seq_len_var, input_size)
-                    h = torch.randn(num_layers * num_directions, hidden_size)
-                    c = torch.randn(num_layers * num_directions, hidden_size)
-                else:
-                    if batch_first:
-                        v = torch.randn(batch_size, seq_len, input_size)
-                        v_var = torch.randn(batch_size, seq_len_var, input_size)
-                    else:
-                        v = torch.randn(seq_len, batch_size, input_size)
-                        v_var = torch.randn(seq_len_var, batch_size, input_size)
-                    h = torch.randn(
-                        num_layers * num_directions, batch_size, hidden_size
-                    )
-                    c = torch.randn(
-                        num_layers * num_directions, batch_size, hidden_size
-                    )
-
-                mod = LstmModule(
-                    input_size,
-                    hidden_size,
-                    num_layers,
-                    bias,
-                    bidirectional,
-                    batch_first,
-                ).eval()
-                maybe_autocast = (
-                    torch.cpu.amp.autocast()
-                    if dtype == torch.bfloat16
-                    else contextlib.nullcontext()
-                )
-
-                with torch.no_grad(), maybe_autocast:
-                    inps = [v]
-                    if not empty_state:
-                        inps.append((h, c))
-
-                    fn_opt = torch._dynamo.optimize("inductor")(mod)
-                    _, code = run_and_get_cpp_code(fn_opt, *inps)
-
-                    # Check that _flat_weights are not functional_tensor, otherwise
-                    # deepcopy will fail during recompilation.
-                    fn_opt_copy = copy.deepcopy(fn_opt)
-                    _flat_weights = fn_opt_copy.lstm._flat_weights
-                    for _flat_weight in _flat_weights:
-                        self.assertFalse(torch._is_functional_tensor(_flat_weight))
-
-                    self.assertTrue("aten.mkldnn_rnn_layer" in code)
-                    self.assertEqual(fn_opt(*inps), mod(*inps))
-                    self.assertEqual(
-                        counters["inductor"]["pattern_matcher_count"],
-                        num_layers * num_directions
-                        + 2,  # num of mkldnn_rnn_layer call + 2 view call on the concatenated hy, cy.
-                    )
-
-                    # Change input sizes
-                    if change_input_sizes:
-                        inps_var = [v_var]
-                        self.assertEqual(fn_opt(*inps_var), mod(*inps_var))
-
-    @slowTest
-    def test_lstm_packed(self):
-        params_dict = {
-            "unbatched": [True, False],
-            "input_size": [1, 2],
-            "hidden_size": [2],
-            "num_layers": [1, 2],
-            "bidirectional": [False, True],
-            "bias": [False, True],
-            "empty_state": [False, True],
-            "batch_first": [True, False],
-            "batch_size": [1, 2],
-            "seq_len": [1, 2],
-        }
-        self._test_lstm_packed(params_dict)
-
-    def test_lstm_packed_change_input_sizes_cpu(self):
-        params_dict = {
-            "unbatched": [False],
-            "input_size": [2],
-            "hidden_size": [5],
-            "num_layers": [3],
-            "bidirectional": [True],
-            "bias": [True],
-            "empty_state": [False],
-            "batch_first": [False],
-            "batch_size": [2],
-            "seq_len": [3],
-        }
-        self._test_lstm_packed(params_dict, change_input_sizes=True)
+    @parametrize(
+        "unbatched, input_size, hidden_size, num_layers, bidirectional, bias, empty_state, batch_first, batch_size, seq_len",
+        itertools.product(
+            *[
+                [False],
+                [2],
+                [5],
+                [3],
+                [True],
+                [True],
+                [False],
+                [False],
+                [2],
+                [3],
+            ]
+        ),
+    )
+    def test_lstm_packed_change_input_sizes_cpu(
+        self,
+        unbatched,
+        input_size,
+        hidden_size,
+        num_layers,
+        bidirectional,
+        bias,
+        empty_state,
+        batch_first,
+        batch_size,
+        seq_len,
+    ):
+        self._test_lstm_packed(
+            unbatched,
+            input_size,
+            hidden_size,
+            num_layers,
+            bidirectional,
+            bias,
+            empty_state,
+            batch_first,
+            batch_size,
+            seq_len,
+            change_input_sizes=True,
+        )
 
     @torch._dynamo.config.patch(dynamic_shapes=True)
     @torch._dynamo.config.patch(assume_static_by_default=False)
@@ -1593,78 +1641,6 @@ class CPUReproTests(TestCase):
 
     @unittest.skipIf(IS_FBCODE, "Not yet runnable in fbcode")
     @unittest.skipIf(
-        not cpu_vec_isa.valid_vec_isa_list()
-        or "avx2" in [str(vec_isa) for vec_isa in cpu_vec_isa.valid_vec_isa_list()],
-        "Does not support vectorization or not s390x/aarch64/ppc64le machine",
-    )
-    @patch("torch.cuda.is_available", lambda: False)
-    def test_auto_zvec_neon_vsx_simd(self):
-        vec_zvec_neon_vsx = cpu_vec_isa.valid_vec_isa_list()[0]
-        self.assertTrue(vec_zvec_neon_vsx.bit_width() == 256)
-
-        with config.patch({"cpp.simdlen": 0}):
-            isa = cpu_vec_isa.pick_vec_isa()
-            self.assertFalse(isa)
-
-        with config.patch({"cpp.simdlen": 1}):
-            isa = cpu_vec_isa.pick_vec_isa()
-            self.assertFalse(isa)
-
-        with config.patch({"cpp.simdlen": 257}):
-            isa = cpu_vec_isa.pick_vec_isa()
-            self.assertFalse(isa)
-
-        with config.patch({"cpp.simdlen": 256}):
-            isa = cpu_vec_isa.pick_vec_isa()
-            self.assertTrue(isa == vec_zvec_neon_vsx)
-
-        pre_var = os.getenv("ATEN_CPU_CAPABILITY")
-        if pre_var:
-            os.environ.pop("ATEN_CPU_CAPABILITY")
-
-        try:
-            with config.patch({"cpp.simdlen": None}):
-                isa = cpu_vec_isa.pick_vec_isa()
-                self.assertTrue(isa == vec_zvec_neon_vsx)
-
-            with config.patch({"cpp.simdlen": None}):
-                os.environ["ATEN_CPU_CAPABILITY"] = "avx2"
-                isa = cpu_vec_isa.pick_vec_isa()
-                self.assertTrue(isa == vec_zvec_neon_vsx)
-
-            with config.patch({"cpp.simdlen": None}):
-                os.environ["ATEN_CPU_CAPABILITY"] = "avx512"
-                isa = cpu_vec_isa.pick_vec_isa()
-                self.assertTrue(isa == vec_zvec_neon_vsx)
-
-            with config.patch({"cpp.simdlen": None}):
-                os.environ["ATEN_CPU_CAPABILITY"] = "default"
-                isa = cpu_vec_isa.pick_vec_isa()
-                self.assertFalse(isa)
-
-            with config.patch({"cpp.simdlen": None}):
-                os.environ["ATEN_CPU_CAPABILITY"] = "neon"
-                isa = cpu_vec_isa.pick_vec_isa()
-                self.assertTrue(isa == vec_zvec_neon_vsx)
-
-            with config.patch({"cpp.simdlen": None}):
-                os.environ["ATEN_CPU_CAPABILITY"] = "zvector"
-                isa = cpu_vec_isa.pick_vec_isa()
-                self.assertTrue(isa == vec_zvec_neon_vsx)
-
-            with config.patch({"cpp.simdlen": None}):
-                os.environ["ATEN_CPU_CAPABILITY"] = "vsx"
-                isa = cpu_vec_isa.pick_vec_isa()
-                self.assertTrue(isa == vec_zvec_neon_vsx)
-
-        finally:
-            if pre_var:
-                os.environ["ATEN_CPU_CAPABILITY"] = pre_var
-            elif os.getenv("ATEN_CPU_CAPABILITY"):
-                os.environ.pop("ATEN_CPU_CAPABILITY")
-
-    @unittest.skipIf(IS_FBCODE, "Not yet runnable in fbcode")
-    @unittest.skipIf(
         platform.machine() != "x86_64" or not cpu_vec_isa.valid_vec_isa_list(),
         "Does not support vectorization or not x86_64 machine",
     )
@@ -1682,6 +1658,15 @@ class CPUReproTests(TestCase):
         self.assertTrue(vec_avx2.nelements() == 8)
         self.assertTrue(vec_avx512.nelements(torch.bfloat16) == 32)
         self.assertTrue(vec_avx2.nelements(torch.bfloat16) == 16)
+
+        with config.patch({"cpp.simdlen": None}):
+            isa = cpu_vec_isa.pick_vec_isa()
+            if vec_amx in cpu_vec_isa.valid_vec_isa_list():
+                self.assertTrue(isa == vec_amx)
+            elif vec_avx512 in cpu_vec_isa.valid_vec_isa_list():
+                self.assertTrue(isa == vec_avx512)
+            else:
+                self.assertTrue(isa == vec_avx2)
 
         with config.patch({"cpp.simdlen": 0}):
             isa = cpu_vec_isa.pick_vec_isa()
@@ -1713,81 +1698,6 @@ class CPUReproTests(TestCase):
             if vec_avx2 in isa_list:
                 isa = cpu_vec_isa.pick_vec_isa()
                 self.assertTrue(isa == vec_avx2)
-
-        pre_var = os.getenv("ATEN_CPU_CAPABILITY")
-        if pre_var:
-            os.environ.pop("ATEN_CPU_CAPABILITY")
-
-        try:
-            with config.patch({"cpp.simdlen": None}):
-                isa = cpu_vec_isa.pick_vec_isa()
-                if vec_amx in cpu_vec_isa.valid_vec_isa_list():
-                    self.assertTrue(isa == vec_amx)
-                elif vec_avx512 in cpu_vec_isa.valid_vec_isa_list():
-                    self.assertTrue(isa == vec_avx512)
-                else:
-                    self.assertTrue(isa == vec_avx2)
-
-            with config.patch({"cpp.simdlen": None}):
-                os.environ["ATEN_CPU_CAPABILITY"] = "avx2"
-                isa = cpu_vec_isa.pick_vec_isa()
-                if vec_amx in cpu_vec_isa.valid_vec_isa_list():
-                    self.assertTrue(isa == vec_avx2)
-                elif vec_avx512 in cpu_vec_isa.valid_vec_isa_list():
-                    self.assertTrue(isa == vec_avx2)
-                elif vec_avx2 in cpu_vec_isa.valid_vec_isa_list():
-                    self.assertTrue(isa == vec_avx2)
-
-            with config.patch({"cpp.simdlen": None}):
-                os.environ["ATEN_CPU_CAPABILITY"] = "avx512"
-                isa = cpu_vec_isa.pick_vec_isa()
-                if vec_amx in cpu_vec_isa.valid_vec_isa_list():
-                    self.assertTrue(isa == vec_amx)
-                elif vec_avx512 in cpu_vec_isa.valid_vec_isa_list():
-                    self.assertTrue(isa == vec_avx512)
-                else:
-                    self.assertTrue(isa == vec_avx2)
-
-            with config.patch({"cpp.simdlen": None}):
-                os.environ["ATEN_CPU_CAPABILITY"] = "default"
-                isa = cpu_vec_isa.pick_vec_isa()
-                self.assertFalse(isa)
-
-            with config.patch({"cpp.simdlen": None}):
-                os.environ["ATEN_CPU_CAPABILITY"] = "neon"
-                isa = cpu_vec_isa.pick_vec_isa()
-                if vec_amx in cpu_vec_isa.valid_vec_isa_list():
-                    self.assertTrue(isa == vec_amx)
-                elif vec_avx512 in cpu_vec_isa.valid_vec_isa_list():
-                    self.assertTrue(isa == vec_avx512)
-                else:
-                    self.assertTrue(isa == vec_avx2)
-
-            with config.patch({"cpp.simdlen": None}):
-                os.environ["ATEN_CPU_CAPABILITY"] = "zvector"
-                isa = cpu_vec_isa.pick_vec_isa()
-                if vec_amx in cpu_vec_isa.valid_vec_isa_list():
-                    self.assertTrue(isa == vec_amx)
-                elif vec_avx512 in cpu_vec_isa.valid_vec_isa_list():
-                    self.assertTrue(isa == vec_avx512)
-                else:
-                    self.assertTrue(isa == vec_avx2)
-
-            with config.patch({"cpp.simdlen": None}):
-                os.environ["ATEN_CPU_CAPABILITY"] = "vsx"
-                isa = cpu_vec_isa.pick_vec_isa()
-                if vec_amx in cpu_vec_isa.valid_vec_isa_list():
-                    self.assertTrue(isa == vec_amx)
-                elif vec_avx512 in cpu_vec_isa.valid_vec_isa_list():
-                    self.assertTrue(isa == vec_avx512)
-                else:
-                    self.assertTrue(isa == vec_avx2)
-
-        finally:
-            if pre_var:
-                os.environ["ATEN_CPU_CAPABILITY"] = pre_var
-            elif os.getenv("ATEN_CPU_CAPABILITY"):
-                os.environ.pop("ATEN_CPU_CAPABILITY")
 
     @requires_vectorization
     @patch("torch.cuda.is_available", lambda: False)
@@ -2769,7 +2679,6 @@ class CPUReproTests(TestCase):
                 1,
             )
 
-    @requires_vectorization
     def test_argmin(self):
         def fn(x):
             return torch.argmin(x, -1)
@@ -2781,7 +2690,6 @@ class CPUReproTests(TestCase):
             self.common(fn, (x,))
             assert metrics.generated_cpp_vec_kernel_count == 1
 
-    @requires_vectorization
     def test_argmax_argmin_with_nan_value(self):
         def fn(x):
             return torch.argmax(x)
@@ -3666,7 +3574,6 @@ class CPUReproTests(TestCase):
             self.common(m, (idx, x))
             check_metrics_vec_kernel_count(1)
 
-    @requires_vectorization
     def test_embedding_vec_bf16(self):
         class M(torch.nn.Module):
             def __init__(self) -> None:
@@ -4008,7 +3915,7 @@ class CPUReproTests(TestCase):
         x = torch.randint(0, 100, (819,), dtype=torch.int64)
         metrics.reset()
         self.common(fn, (x,))
-        check_metrics_vec_kernel_count(1)
+        assert metrics.generated_cpp_vec_kernel_count == 1
 
     def test_highp_to_lowp_cse_var_cache_with_store(self):
         # Fix issue: https://github.com/pytorch/pytorch/issues/128263
@@ -4042,7 +3949,7 @@ class CPUReproTests(TestCase):
         x = torch.randint(0, 100, (22, 51), dtype=torch.int64)
         metrics.reset()
         self.common(fn, (x,))
-        check_metrics_vec_kernel_count(1)
+        assert metrics.generated_cpp_vec_kernel_count == 1
 
     @config.patch({"cpp.dynamic_threads": True})
     def test_reduction_with_dynamic_threads(self):
@@ -4153,7 +4060,6 @@ class CPUReproTests(TestCase):
                 exactly=True,
             ).run(code)
 
-    @requires_vectorization
     def test_repeated_exp(self):
         def fn(x):
             y = x.sigmoid()
@@ -4182,7 +4088,6 @@ class CPUReproTests(TestCase):
                 self.common(fn, (x,))
                 check_metrics_vec_kernel_count(1)
 
-    @requires_vectorization
     def test_consistent_remove_buffers(self):
         def fn(x):
             z = x + x
